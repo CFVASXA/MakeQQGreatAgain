@@ -6,6 +6,7 @@
 const path = require("path");
 const host = require("./host.js");
 const hooks = require("./hooks.js");
+const moduleCache = require("./module-cache.js");
 
 const ORIGINAL_ENTRY = "./application.asar/app_launcher/index.js";
 
@@ -119,40 +120,50 @@ function buildApi() {
         try {
             const electron = require("electron");
             const previousModules = new Map(Array.from(state.pluginModules, ([plugin, exports]) => [plugin.manifest.slug, exports]));
+            const report = {reloaded:[],errors:[],restartRequired:[]};
+            const restart = (slug) => { if (!report.restartRequired.includes(slug)) report.restartRequired.push(slug); };
             state.pluginModules.clear();
             state.plugins = host.loadPlugins();
-            globals.plugins = publicPlugins();
             for (const plugin of Object.values(state.plugins)) {
-                if (plugin.disabled || plugin.incompatible || !plugin.path.injects.main) continue;
+                const slug = plugin.manifest.slug, previous = previousModules.get(slug);
+                if (plugin.disabled || plugin.incompatible || !plugin.path.injects.main) {
+                    if (previous) { restart(slug); plugin.restartRequired = true; }
+                    continue;
+                }
                 const file = plugin.path.injects.main;
-                try { delete require.cache[require.resolve(file)]; } catch (e) { /* 忽略 */ }
+                const plan = moduleCache.clearPluginCache(plugin.path.plugin);
+                if (plan.restartRequired.length) {
+                    if (previous) state.pluginModules.set(plugin,previous);
+                    plugin.restartRequired = true; restart(slug);
+                    host.setStage(slug,"main",false,"存在原生、ESM 或初始化中的模块，需要重启 QQ");
+                    host.log("插件无法安全热重载，需重启: " + slug);
+                    continue;
+                }
                 try {
                     const exports = require(file);
-                    state.pluginModules.set(plugin, exports || {});
-                    host.setStage(plugin.manifest.slug, "main", true);
-                } catch (e) {
-                    const msg = (e && e.message) || String(e);
-                    // 重复注册（第二次 handler）不影响已有实现，视为仍可用
-                    if (/second handler|already registered/i.test(msg) && previousModules.has(plugin.manifest.slug)) {
-                        state.pluginModules.set(plugin, previousModules.get(plugin.manifest.slug));
-                        host.setStage(plugin.manifest.slug, "main", true);
-                        host.log(`刷新：${plugin.manifest.slug} 重复注册提示（沿用原 handler）: ${msg}`);
-                    } else {
-                        host.setStage(plugin.manifest.slug, "main", false, msg);
-                        host.log(`刷新时插件主进程段失败 [${plugin.manifest.slug}]:`, e);
-                    }
+                    state.pluginModules.set(plugin,exports || {});
+                    plugin.restartRequired = false;
+                    report.reloaded.push(slug); host.setStage(slug,"main",true);
+                } catch (error) {
+                    const message = error?.message || String(error);
+                    if (previous) { state.pluginModules.set(plugin,previous); plugin.restartRequired = true; restart(slug); }
+                    report.errors.push({slug,error:message});
+                    host.setStage(slug,"main",false,message);
+                    host.log("插件重载失败，旧回调保留: " + slug,error);
                 }
             }
+            for (const slug of previousModules.keys()) if (!Object.prototype.hasOwnProperty.call(state.plugins,slug)) restart(slug);
+            globals.plugins = publicPlugins();
             try {
                 for (const wc of electron.webContents.getAllWebContents()) {
-                    try { wc.send("mqga.rerun"); } catch (e) { /* 忽略 */ }
+                    try { wc.send("mqga.rerun"); } catch (_) {}
                 }
-            } catch (e) { host.log("通知渲染进程重载失败:", e); }
-            host.log("已刷新插件（重扫目录 + 重载主进程段 + 通知渲染进程）");
-            return { plugins: publicPlugins(), at: Date.now() };
-        } catch (e) {
-            host.log("刷新插件失败:", e);
-            return { error: (e && e.message) || String(e) };
+            } catch (error) { host.log("通知渲染进程重载失败:",error); }
+            host.log("插件重载结果:",report);
+            return {...report,plugins:publicPlugins(),at:Date.now()};
+        } catch (error) {
+            host.log("刷新插件失败:",error);
+            return {error:error?.message || String(error)};
         }
     };
     api.pluginsInfo = () => publicPlugins();
@@ -202,6 +213,7 @@ function publicPlugins() {
             manifest: plugin.manifest,
             disabled: plugin.disabled,
             incompatible: plugin.incompatible,
+            restartRequired: !!plugin.restartRequired,
             path: plugin.path,
             stages: host.stagesFor(plugin.manifest.slug),
             protected: protectedList.includes(slug),
