@@ -111,6 +111,7 @@ test("native QQ entry is attempted when loader bootstrap fails",()=>{
     const req=(name)=>{
         if (name==="path") return path;
         if (name==="./host.js") return host;
+        if (name==="./module-cache.js") return require(path.join(loaderRoot,"src","module-cache.js"));
         if (name==="./hooks.js") return {installElectronHook(){throw new Error("simulated loader failure");}};
         if (name===path.join(temp,"package.json")) return {version:"test-fixed"};
         if (name.includes("application.asar")) {nativeStarts++;return {};}
